@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand/v2"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -274,4 +275,47 @@ func FuzzReadRawRecordsDirect(f *testing.F) {
 			t.Fatalf("decoded %d records into %d slots", got, n)
 		}
 	})
+}
+
+// BenchmarkReadRawRecordsDirect decodes a 500 record batch. Records with
+// headers carry the same header keys, as tracing or schema headers do; the
+// sparse case has headers on only the first record.
+func BenchmarkReadRawRecordsDirect(b *testing.B) {
+	for _, tc := range []struct {
+		name   string
+		nh     int
+		sparse bool
+	}{
+		{"headers=0", 0, false},
+		{"headers=1", 1, false},
+		{"headers=4", 4, false},
+		{"headers=4-sparse", 4, true},
+	} {
+		var raw []byte
+		for i := range 500 {
+			r := kmsg.Record{
+				OffsetDelta: int32(i),
+				Key:         []byte("key-0123456789"),
+				Value:       make([]byte, 100),
+			}
+			for j := range tc.nh {
+				if tc.sparse && i > 0 {
+					break
+				}
+				r.Headers = append(r.Headers, kmsg.Header{Key: "header-key-" + strconv.Itoa(j), Value: []byte("header-value")})
+			}
+			r.Length = int32(len(r.AppendTo(nil)) - 1)
+			raw = r.AppendTo(raw)
+		}
+		b.Run(tc.name, func(b *testing.B) {
+			rs := make([]Record, 500)
+			batch := new(kmsg.RecordBatch)
+			b.ReportAllocs()
+			for b.Loop() {
+				if n := readRawRecordsDirect(context.Background(), rs, raw, "t", 0, batch); n != len(rs) {
+					b.Fatalf("decoded %d records, want %d", n, len(rs))
+				}
+			}
+		})
+	}
 }
