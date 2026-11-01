@@ -2107,6 +2107,49 @@ func (o *ProcessFetchPartitionOpts) processRecordBatch(
 	return ndecoded, uncompressedBytes
 }
 
+// headerSlab decodes record headers for readRawRecordsDirect. Records in a
+// batch usually carry the same header keys (tracing, schema, routing), so we
+// carve every record's headers out of one shared slab and reuse the previous
+// record's key strings when the bytes match, rather than allocating a slice
+// per record and a string per header. This lives outside the record loop
+// because decoding headers inline slowed down header-less batches.
+type headerSlab struct {
+	slab []RecordHeader
+	recs int
+	prev []RecordHeader
+}
+
+// read decodes nh headers from b; recsLeft and inLeft are the records and
+// input bytes left in the batch, including the current record.
+func (s *headerSlab) read(b *kbin.Reader, nh, recsLeft, inLeft int) []RecordHeader {
+	if len(s.slab) < nh {
+		// Size the slab for the next s.recs records having nh headers
+		// each, doubling every time we run out: sizing for every
+		// remaining record would waste a lot when only a few records
+		// have headers. Each header takes at least two bytes, so a
+		// bogus header count cannot make us allocate more than the
+		// remaining input could hold.
+		s.slab = make([]RecordHeader, max(nh, min(nh*min(s.recs, recsLeft), inLeft/2)))
+		s.recs *= 2
+	}
+	// Capping the capacity makes a user's append to Headers reallocate
+	// instead of overwriting the next record's headers.
+	headers := s.slab[:nh:nh]
+	s.slab = s.slab[nh:]
+	for i := range headers {
+		kb := b.VarintBytes()
+		var key string
+		if i < len(s.prev) && string(kb) == s.prev[i].Key {
+			key = s.prev[i].Key
+		} else {
+			key = string(kb)
+		}
+		headers[i] = RecordHeader{Key: key, Value: b.VarintBytes()}
+	}
+	s.prev = headers
+	return headers
+}
+
 // readRawRecordsDirect decodes up to len(rs) raw v2 records from in into rs,
 // returning how many it decoded; it stops at the first record that is
 // truncated or does not decode.
@@ -2114,6 +2157,7 @@ func readRawRecordsDirect(ctx context.Context, rs []Record, in []byte, topic str
 	var (
 		attrs = RecordAttrs{uint8(batch.Attributes)}
 		n     int
+		hs    = headerSlab{recs: 8}
 	)
 	for ; n < len(rs); n++ {
 		length, used := kbin.Varint(in)
@@ -2129,10 +2173,7 @@ func readRawRecordsDirect(ctx context.Context, rs []Record, in []byte, topic str
 		value := b.VarintBytes()
 		var headers []RecordHeader
 		if nh := int(b.VarintArrayLen()); nh > 0 {
-			headers = make([]RecordHeader, nh)
-			for i := range headers {
-				headers[i] = RecordHeader{Key: b.VarintString(), Value: b.VarintBytes()}
-			}
+			headers = hs.read(&b, nh, len(rs)-n, len(in))
 		}
 		if !b.Ok() {
 			break
